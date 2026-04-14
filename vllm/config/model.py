@@ -218,6 +218,16 @@ class ModelConfig:
     specified in `SamplingParams`. The default value comes the default for the
     OpenAI Chat Completions API. -1 means no cap, i.e. all (output_length *
     vocab_size) logprobs are allowed to be returned and it may cause OOM."""
+    max_prompt_logprob_tokens: int | None = None
+    """Engine-level cap on the number of prompt tokens for which prompt
+    logprobs are computed.  When set to a positive integer N, all requests
+    are limited to computing prompt logprobs for at most the last N tokens
+    of the prompt (equivalent to setting ``prompt_logprob_token_limit=N``
+    for every request).  Per-request ``prompt_logprob_token_limit`` values
+    are further capped to this engine limit.  ``None`` (default) means no
+    additional limit beyond what each request specifies.  Setting this is
+    recommended when serving large-vocabulary models to prevent OOM errors
+    caused by long-prompt prompt logprob requests."""
     logprobs_mode: LogprobsMode = "raw_logprobs"
     """Indicates the content returned in the logprobs and prompt_logprobs.
     Supported mode:

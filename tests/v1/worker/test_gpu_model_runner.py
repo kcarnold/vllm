@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
-from typing import NoReturn
 
 import numpy as np
 import pytest
@@ -517,71 +516,184 @@ def test_update_config(model_runner):
         model_runner.update_config({"do_not_exist_config": "dummy"})
 
 
-def test_prompt_logprobs_does_not_materialize_full_logprobs():
-    """Regression test for prompt-logprobs OOM on long prompts.
 
-    Desired behavior: prompt logprobs should not require calling
-    `sampler.compute_logprobs` (which materializes a full-vocab log_softmax).
-    """
-    req_id = "req_test"
-    prompt_token_ids = [1, 2, 3, 4]
-    num_prompt_logprobs = 2
-    num_logits = 3
-    vocab_size = 16
+def _make_fake_runner(
+    prompt_token_ids: list[int],
+    num_prompt_logprobs: int,
+    num_logits: int,
+    vocab_size: int,
+    weight: torch.Tensor,
+    token_limit: int | None = None,
+) -> tuple[SimpleNamespace, str]:
+    """Build a minimal fake GPUModelRunner for prompt-logprob unit tests."""
+    from vllm.v1.sample.sampler import Sampler
 
-    fake_runner = SimpleNamespace()
-    fake_runner.num_prompt_logprobs = {req_id: num_prompt_logprobs}
-    fake_runner.device = torch.device("cpu")
-    fake_runner.requests = {
-        req_id: SimpleNamespace(prompt_token_ids=prompt_token_ids,
-                                num_computed_tokens=0)
+    req_id = "req0"
+    runner = SimpleNamespace()
+    runner.num_prompt_logprobs = {req_id: num_prompt_logprobs}
+    runner.prompt_logprob_token_limits = (
+        {req_id: token_limit} if token_limit is not None else {}
+    )
+    runner.device = torch.device("cpu")
+    runner.requests = {
+        req_id: SimpleNamespace(
+            prompt_token_ids=prompt_token_ids,
+            num_computed_tokens=0,
+        )
     }
-    fake_runner.query_start_loc = SimpleNamespace(np=np.array([0, num_logits]))
-    fake_runner._sync_device = lambda: None
-    fake_runner.input_batch = SimpleNamespace(
+    runner.query_start_loc = SimpleNamespace(np=np.array([0, num_logits]))
+    runner._sync_device = lambda: None
+    runner.input_batch = SimpleNamespace(
         in_progress_prompt_logprobs_cpu={},
         req_id_to_index={req_id: 0},
     )
 
-    def _compute_logits(hidden_states: torch.Tensor) -> torch.Tensor:
-        assert hidden_states.shape[0] == num_logits
-        return torch.zeros((num_logits, vocab_size), dtype=torch.float32)
+    # A deterministic LM-head: hidden @ weight.T → logits.
+    def compute_logits(hs: torch.Tensor) -> torch.Tensor:
+        return hs @ weight.T
 
-    fake_runner.model = SimpleNamespace(compute_logits=_compute_logits)
+    runner.model = SimpleNamespace(compute_logits=compute_logits)
+    runner.sampler = SimpleNamespace(
+        compute_logprobs=Sampler.compute_logprobs,
+        gather_logprobs=Sampler.gather_logprobs,
+    )
+    return runner, req_id
 
-    def _raise_oom(logits: torch.Tensor) -> NoReturn:
-        assert logits.ndim == 2
-        raise torch.OutOfMemoryError(
-            "CUDA out of memory when materializing full log_softmax"
-        )
 
-    def _gather_logprobs(
-        logprobs: torch.Tensor,
-        num_top_logprobs: int,
-        token_ids: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
-        return (
-            token_ids.unsqueeze(-1),
-            torch.zeros(
-                (token_ids.shape[0], num_top_logprobs + 1), dtype=torch.float32
-            ),
-            torch.ones((token_ids.shape[0],), dtype=torch.int64),
-            None,
-        )
+def test_prompt_logprobs_chunked_computation(monkeypatch):
+    """Chunked logprob computation gives identical output to a single pass.
 
-    fake_runner.sampler = SimpleNamespace(
-        compute_logprobs=_raise_oom,
-        gather_logprobs=_gather_logprobs,
+    The inner loop in _get_prompt_logprobs_dict splits the LM-head call into
+    sub-chunks of size _PROMPT_LOGPROBS_CHUNK_SIZE to cap peak GPU memory.
+    This test forces a very small chunk size (3 tokens) so the chunking path
+    is exercised even for short prompts, and checks that the result matches a
+    single-pass reference computation.
+    """
+    import vllm.v1.worker.gpu_model_runner as gmr
+    from vllm.v1.sample.sampler import Sampler
+
+    # Force small chunk size to exercise multi-chunk code path.
+    monkeypatch.setattr(gmr, "_PROMPT_LOGPROBS_CHUNK_SIZE", 3)
+
+    torch.manual_seed(0)
+    vocab_size = 32
+    hidden_size = 8
+    num_prompt_tokens = 10
+    num_prompt_logprobs = 2
+
+    prompt_token_ids = torch.randint(0, vocab_size, (num_prompt_tokens,)).tolist()
+    weight = torch.randn(vocab_size, hidden_size)
+    # Hidden states for the num_prompt_tokens - 1 positions that have logprobs.
+    num_logits = num_prompt_tokens - 1
+    hidden_states = torch.randn(num_logits, hidden_size)
+
+    runner, req_id = _make_fake_runner(
+        prompt_token_ids, num_prompt_logprobs, num_logits, vocab_size, weight
     )
 
-    hidden_states = torch.zeros((num_logits, 8), dtype=torch.float32)
+    # Run the chunked path under test.
     out = GPUModelRunner._get_prompt_logprobs_dict(
-        fake_runner,
+        runner,
         hidden_states=hidden_states,
         num_scheduled_tokens={req_id: num_logits},
     )
+
     assert req_id in out
-    assert isinstance(out[req_id], LogprobsTensors)
+    result = out[req_id]
+    assert isinstance(result, LogprobsTensors)
+    assert result.logprobs.shape == (num_prompt_tokens - 1, num_prompt_logprobs + 1)
+    assert result.selected_token_ranks.shape == (num_prompt_tokens - 1,)
+
+    # Reference: single-pass computation.
+    full_logits = hidden_states @ weight.T
+    full_log_probs = Sampler.compute_logprobs(full_logits)
+    tgt = torch.tensor(prompt_token_ids[1:], dtype=torch.int64)
+    ref = Sampler.gather_logprobs(full_log_probs, num_prompt_logprobs, tgt)
+
+    torch.testing.assert_close(result.logprobs, ref.logprobs)
+    torch.testing.assert_close(
+        result.logprob_token_ids.to(torch.int64),
+        ref.logprob_token_ids.to(torch.int64),
+    )
+    torch.testing.assert_close(
+        result.selected_token_ranks.to(torch.int64),
+        ref.selected_token_ranks.to(torch.int64),
+    )
+
+
+def test_prompt_logprob_token_limit(monkeypatch):
+    """prompt_logprob_token_limit skips computation for early prompt tokens.
+
+    Positions within the limit window should have valid computed logprobs
+    (non-zero values matching the reference computation).  Positions outside
+    the window should have logprob == 0.0 and rank == 0 (zero-initialised).
+    """
+    import vllm.v1.worker.gpu_model_runner as gmr
+    from vllm.v1.sample.sampler import Sampler
+
+    monkeypatch.setattr(gmr, "_PROMPT_LOGPROBS_CHUNK_SIZE", 3)
+
+    torch.manual_seed(1)
+    vocab_size = 32
+    hidden_size = 8
+    num_prompt_tokens = 10
+    num_prompt_logprobs = 2
+    token_limit = 4  # only compute logprobs for last 4 tokens
+
+    prompt_token_ids = torch.randint(0, vocab_size, (num_prompt_tokens,)).tolist()
+    weight = torch.randn(vocab_size, hidden_size)
+    num_logits = num_prompt_tokens - 1
+    hidden_states = torch.randn(num_logits, hidden_size)
+
+    runner, req_id = _make_fake_runner(
+        prompt_token_ids,
+        num_prompt_logprobs,
+        num_logits,
+        vocab_size,
+        weight,
+        token_limit=token_limit,
+    )
+
+    out = GPUModelRunner._get_prompt_logprobs_dict(
+        runner,
+        hidden_states=hidden_states,
+        num_scheduled_tokens={req_id: num_logits},
+    )
+
+    assert req_id in out
+    result = out[req_id]
+    assert isinstance(result, LogprobsTensors)
+    # Output always covers the full prompt (zero-filled for skipped positions).
+    assert result.logprobs.shape == (num_prompt_tokens - 1, num_prompt_logprobs + 1)
+
+    # Skipped prefix positions should have logprob == 0 and rank == 0.
+    num_skipped = num_prompt_tokens - 1 - token_limit
+    skipped_logprobs = result.logprobs[:num_skipped]
+    skipped_ranks = result.selected_token_ranks[:num_skipped]
+    assert (skipped_logprobs == 0.0).all(), (
+        "Skipped positions should be zero-initialised"
+    )
+    assert (skipped_ranks == 0).all(), (
+        "Skipped positions should have rank 0"
+    )
+
+    # Computed suffix positions should match the single-pass reference.
+    full_logits = hidden_states @ weight.T
+    full_log_probs = Sampler.compute_logprobs(full_logits)
+    tgt = torch.tensor(prompt_token_ids[1:], dtype=torch.int64)
+    ref = Sampler.gather_logprobs(full_log_probs, num_prompt_logprobs, tgt)
+
+    torch.testing.assert_close(
+        result.logprobs[num_skipped:], ref.logprobs[num_skipped:]
+    )
+    torch.testing.assert_close(
+        result.logprob_token_ids[num_skipped:].to(torch.int64),
+        ref.logprob_token_ids[num_skipped:].to(torch.int64),
+    )
+    torch.testing.assert_close(
+        result.selected_token_ranks[num_skipped:].to(torch.int64),
+        ref.selected_token_ranks[num_skipped:].to(torch.int64),
+    )
 
 
 def test_load_model_weights_inplace(dist_init, model_runner, model_runner_2):
