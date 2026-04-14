@@ -524,7 +524,7 @@ def test_prompt_logprobs_does_not_materialize_full_logprobs():
     """
     req_id = "req_oom"
     prompt_token_ids = [1, 2, 3, 4]
-    num_prompt_logprobs = 0
+    num_prompt_logprobs = 2
     num_logits = 3
     vocab_size = 16
 
@@ -553,10 +553,16 @@ def test_prompt_logprobs_does_not_materialize_full_logprobs():
             "CUDA out of memory when materializing full log_softmax"
         )
 
-    def _gather_logprobs(logprobs: torch.Tensor, k: int, token_ids: torch.Tensor):
+    def _gather_logprobs(
+        logprobs: torch.Tensor,
+        num_top_logprobs: int,
+        token_ids: torch.Tensor,
+    ):
         return (
             token_ids.unsqueeze(-1),
-            torch.zeros((token_ids.shape[0], k + 1), dtype=torch.float32),
+            torch.zeros(
+                (token_ids.shape[0], num_top_logprobs + 1), dtype=torch.float32
+            ),
             torch.ones((token_ids.shape[0],), dtype=torch.int64),
             None,
         )
