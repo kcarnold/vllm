@@ -549,7 +549,8 @@ def test_prompt_logprobs_does_not_materialize_full_logprobs():
 
     fake_runner.model = SimpleNamespace(compute_logits=_compute_logits)
 
-    def _raise_oom(_: torch.Tensor) -> NoReturn:
+    def _raise_oom(logits: torch.Tensor) -> NoReturn:
+        assert logits.ndim == 2
         raise torch.OutOfMemoryError(
             "CUDA out of memory when materializing full log_softmax"
         )
