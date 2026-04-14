@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from types import SimpleNamespace
+from typing import NoReturn
 
 import numpy as np
 import pytest
@@ -522,7 +523,7 @@ def test_prompt_logprobs_does_not_materialize_full_logprobs():
     Desired behavior: prompt logprobs should not require calling
     `sampler.compute_logprobs` (which materializes a full-vocab log_softmax).
     """
-    req_id = "req_oom"
+    req_id = "req_test"
     prompt_token_ids = [1, 2, 3, 4]
     num_prompt_logprobs = 2
     num_logits = 3
@@ -548,7 +549,7 @@ def test_prompt_logprobs_does_not_materialize_full_logprobs():
 
     fake_runner.model = SimpleNamespace(compute_logits=_compute_logits)
 
-    def _raise_oom(_: torch.Tensor) -> torch.Tensor:
+    def _raise_oom(_: torch.Tensor) -> NoReturn:
         raise torch.OutOfMemoryError(
             "CUDA out of memory when materializing full log_softmax"
         )
@@ -557,7 +558,7 @@ def test_prompt_logprobs_does_not_materialize_full_logprobs():
         logprobs: torch.Tensor,
         num_top_logprobs: int,
         token_ids: torch.Tensor,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, None]:
         return (
             token_ids.unsqueeze(-1),
             torch.zeros(
