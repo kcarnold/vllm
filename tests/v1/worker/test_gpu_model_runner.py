@@ -38,6 +38,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheGroupSpec,
     KVCacheTensor,
 )
+from vllm.v1.outputs import LogprobsTensors
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
@@ -513,6 +514,66 @@ def test_update_config(model_runner):
     # Raise error on non-existing config
     with pytest.raises(AssertionError):
         model_runner.update_config({"do_not_exist_config": "dummy"})
+
+
+def test_prompt_logprobs_does_not_materialize_full_logprobs():
+    """Regression test for prompt-logprobs OOM on long prompts.
+
+    Desired behavior: prompt logprobs should not require calling
+    `sampler.compute_logprobs` (which materializes a full-vocab log_softmax).
+    """
+    req_id = "req_oom"
+    prompt_token_ids = [1, 2, 3, 4]
+    num_prompt_logprobs = 0
+    num_logits = 3
+    vocab_size = 16
+
+    fake_runner = SimpleNamespace()
+    fake_runner.num_prompt_logprobs = {req_id: num_prompt_logprobs}
+    fake_runner.device = torch.device("cpu")
+    fake_runner.requests = {
+        req_id: SimpleNamespace(prompt_token_ids=prompt_token_ids,
+                                num_computed_tokens=0)
+    }
+    fake_runner.query_start_loc = SimpleNamespace(np=np.array([0, num_logits]))
+    fake_runner._sync_device = lambda: None
+    fake_runner.input_batch = SimpleNamespace(
+        in_progress_prompt_logprobs_cpu={},
+        req_id_to_index={req_id: 0},
+    )
+
+    def _compute_logits(hidden_states: torch.Tensor) -> torch.Tensor:
+        assert hidden_states.shape[0] == num_logits
+        return torch.zeros((num_logits, vocab_size), dtype=torch.float32)
+
+    fake_runner.model = SimpleNamespace(compute_logits=_compute_logits)
+
+    def _raise_oom(_: torch.Tensor) -> torch.Tensor:
+        raise torch.OutOfMemoryError(
+            "CUDA out of memory when materializing full log_softmax"
+        )
+
+    def _gather_logprobs(logprobs: torch.Tensor, k: int, token_ids: torch.Tensor):
+        return (
+            token_ids.unsqueeze(-1),
+            torch.zeros((token_ids.shape[0], k + 1), dtype=torch.float32),
+            torch.ones((token_ids.shape[0],), dtype=torch.int64),
+            None,
+        )
+
+    fake_runner.sampler = SimpleNamespace(
+        compute_logprobs=_raise_oom,
+        gather_logprobs=_gather_logprobs,
+    )
+
+    hidden_states = torch.zeros((num_logits, 8), dtype=torch.float32)
+    out = GPUModelRunner._get_prompt_logprobs_dict(
+        fake_runner,
+        hidden_states=hidden_states,
+        num_scheduled_tokens={req_id: num_logits},
+    )
+    assert req_id in out
+    assert isinstance(out[req_id], LogprobsTensors)
 
 
 def test_load_model_weights_inplace(dist_init, model_runner, model_runner_2):
