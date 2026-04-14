@@ -226,7 +226,7 @@ PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 # prompt logprobs.  Splitting the LM-head call into small sub-chunks keeps
 # the peak GPU allocation bounded to roughly
 #   _PROMPT_LOGPROBS_CHUNK_SIZE * vocab_size * sizeof(float32)
-# instead of  num_prompt_tokens * vocab_size * sizeof(float32), avoiding OOM
+# instead of num_prompt_tokens * vocab_size * sizeof(float32), avoiding OOM
 # on long prompts for large-vocabulary models.
 _PROMPT_LOGPROBS_CHUNK_SIZE: int = 128
 

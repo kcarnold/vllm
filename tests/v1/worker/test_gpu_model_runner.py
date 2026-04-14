@@ -525,7 +525,11 @@ def _make_fake_runner(
     weight: torch.Tensor,
     token_limit: int | None = None,
 ) -> tuple[SimpleNamespace, str]:
-    """Build a minimal fake GPUModelRunner for prompt-logprob unit tests."""
+    """Build a minimal fake GPUModelRunner for prompt-logprob unit tests.
+
+    This is a plain helper function (not a pytest fixture) because it
+    requires several parameters that differ between test cases.
+    """
     from vllm.v1.sample.sampler import Sampler
 
     req_id = "req0"
