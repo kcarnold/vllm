@@ -236,6 +236,13 @@ class SamplingParams(
     prompt_logprobs: int | None = None
     """Number of log probabilities to return per prompt token.
     When set to -1, return all `vocab_size` log probabilities."""
+    prompt_logprob_token_limit: int | None = None
+    """When set to a positive integer N, only compute and return prompt
+    logprobs for the last N tokens of the prompt.  Positions before the
+    limit window are not computed, keeping the logprobs at 0.0 / rank 0.
+    This reduces memory and computation for long-prompt requests where
+    only the tail of the prompt is of interest.  When ``None`` (default),
+    prompt logprobs are computed for all prompt tokens."""
     logprob_token_ids: list[int] | None = None
     """Specific token IDs to return logprobs for. More efficient than
     logprobs=-1 when you only need logprobs for a small set of tokens.
@@ -513,6 +520,16 @@ class SamplingParams(
                 f"{self.prompt_logprobs}.",
                 parameter="prompt_logprobs",
                 value=self.prompt_logprobs,
+            )
+        if (
+            self.prompt_logprob_token_limit is not None
+            and self.prompt_logprob_token_limit <= 0
+        ):
+            raise VLLMValidationError(
+                f"prompt_logprob_token_limit must be a positive integer, got "
+                f"{self.prompt_logprob_token_limit}.",
+                parameter="prompt_logprob_token_limit",
+                value=self.prompt_logprob_token_limit,
             )
         assert isinstance(self.stop_token_ids, list)
         if not all(isinstance(st_id, int) for st_id in self.stop_token_ids):

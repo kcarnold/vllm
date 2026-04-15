@@ -222,6 +222,13 @@ AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
 PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
 
+# Maximum number of prompt tokens processed per sub-chunk when computing
+# prompt logprobs.  Splitting the LM-head call into small sub-chunks keeps
+# the peak GPU allocation bounded to roughly
+#   _PROMPT_LOGPROBS_CHUNK_SIZE * vocab_size * sizeof(float32)
+# instead of num_prompt_tokens * vocab_size * sizeof(float32), avoiding OOM
+# on long prompts for large-vocabulary models.
+_PROMPT_LOGPROBS_CHUNK_SIZE: int = 128
 
 # Wrapper for ModelRunnerOutput to support overlapped execution.
 class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
@@ -597,6 +604,10 @@ class GPUModelRunner(
         # NOTE(rob): num_prompt_logprobs only includes reqs
         # that are currently in the prefill phase.
         self.num_prompt_logprobs: dict[str, int] = {}
+        # Per-request cap on how many prompt tokens receive logprobs.
+        # Only populated when sampling_params.prompt_logprob_token_limit or
+        # model_config.max_prompt_logprob_tokens is set.
+        self.prompt_logprob_token_limits: dict[str, int] = {}
 
         # Input Batch
         # NOTE(Chen): Ideally, we should initialize the input batch inside
@@ -1070,6 +1081,7 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            self.prompt_logprob_token_limits.pop(req_id, None)
         self.late_interaction_runner.on_requests_finished(
             scheduler_output.finished_req_ids
         )
@@ -1175,6 +1187,17 @@ class GPUModelRunner(
                     if sampling_params.prompt_logprobs == -1
                     else sampling_params.prompt_logprobs
                 )
+                # Resolve per-request and engine-level token limits.
+                req_limit = sampling_params.prompt_logprob_token_limit
+                engine_limit = self.model_config.max_prompt_logprob_tokens
+                if engine_limit is not None:
+                    req_limit = (
+                        engine_limit
+                        if req_limit is None
+                        else min(req_limit, engine_limit)
+                    )
+                if req_limit is not None:
+                    self.prompt_logprob_token_limits[req_id] = req_limit
 
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             if self.uses_mrope:
@@ -5048,12 +5071,20 @@ class GPUModelRunner(
 
             # Set up target LogprobsTensors object.
             logprobs_tensors = in_progress_dict.get(req_id)
+            token_limit = self.prompt_logprob_token_limits.get(req_id)
             if not logprobs_tensors:
                 # Create empty logprobs CPU tensors for the entire prompt.
                 # If chunked, we'll copy in slice by slice.
                 logprobs_tensors = LogprobsTensors.empty_cpu(
                     num_prompt_tokens - 1, num_prompt_logprobs + 1
                 )
+                if token_limit is not None:
+                    # Zero-initialise so positions outside the limit window
+                    # have defined (zero) values rather than uninitialised
+                    # memory.
+                    logprobs_tensors.logprob_token_ids.zero_()
+                    logprobs_tensors.logprobs.zero_()
+                    logprobs_tensors.selected_token_ranks.zero_()
                 in_progress_dict[req_id] = logprobs_tensors
 
             # Determine number of logits to retrieve.
@@ -5078,33 +5109,92 @@ class GPUModelRunner(
                 # step. There are no more prompt logprobs to produce.
                 continue
 
-            # Get the logits corresponding to this req's prompt tokens.
-            # If this is a partial request (i.e. chunked prefill),
-            # then there is prompt logprob generated for each index.
+            # Apply per-request token limit: only compute logprobs for the
+            # last ``token_limit`` tokens of the prompt.  Tokens before the
+            # limit window are already zero-initialised (see above), so we
+            # just skip them here.
             req_idx = self.input_batch.req_id_to_index[req_id]
             offset = self.query_start_loc.np[req_idx].item()
-            prompt_hidden_states = hidden_states[offset : offset + num_logits]
-            logits = self.model.compute_logits(prompt_hidden_states)
+            if token_limit is not None:
+                # First output position (0-indexed into logprobs_tensors)
+                # that needs to be computed.
+                limit_offset = max(0, num_prompt_tokens - 1 - token_limit)
+                # How many tokens at the start of the current chunk fall
+                # before the limit window and can be skipped.
+                logit_skip = max(0, min(limit_offset - start_idx, num_logits))
+            else:
+                logit_skip = 0
 
-            # Get the "target" tokens for each index. For prompt at index i,
-            # the token at prompt index i+1 is the "sampled" token we want
-            # to gather the logprob for.
-            tgt_token_ids = prompt_token_ids[start_tok : start_tok + num_logits]
+            effective_offset = offset + logit_skip
+            effective_start_idx = start_idx + logit_skip
+            effective_start_tok = start_tok + logit_skip
+            effective_num_logits = num_logits - logit_skip
 
-            # Compute prompt logprobs.
-            logprobs = self.sampler.compute_logprobs(logits)
-            token_ids, logprobs, ranks, _ = self.sampler.gather_logprobs(
-                logprobs, num_prompt_logprobs, tgt_token_ids
-            )
+            if effective_num_logits <= 0:
+                # Entire scheduler chunk is before the limit window.
+                continue
+
+            # Compute prompt logprobs in sub-chunks to bound peak GPU memory.
+            # Without sub-chunking the full [effective_num_logits, vocab_size]
+            # log-softmax tensor must be resident in GPU memory at once, which
+            # can OOM for long prompts on large-vocabulary models.
+            all_token_ids: list[torch.Tensor] = []
+            all_logprobs_list: list[torch.Tensor] = []
+            all_ranks: list[torch.Tensor] = []
+            for sub_start in range(
+                0, effective_num_logits, _PROMPT_LOGPROBS_CHUNK_SIZE
+            ):
+                sub_end = min(
+                    sub_start + _PROMPT_LOGPROBS_CHUNK_SIZE,
+                    effective_num_logits,
+                )
+                # Run the LM head on this sub-chunk of hidden states.
+                sub_hidden = hidden_states[
+                    effective_offset + sub_start : effective_offset + sub_end
+                ]
+                sub_logits = self.model.compute_logits(sub_hidden)
+
+                # Target tokens for this sub-chunk.
+                sub_tgt = prompt_token_ids[
+                    effective_start_tok
+                    + sub_start : effective_start_tok
+                    + sub_end
+                ]
+
+                # Compute log-softmax and gather top-k for this sub-chunk.
+                # Peak allocation: [sub_chunk_size, vocab_size] not [N, vocab].
+                sub_logprobs = self.sampler.compute_logprobs(sub_logits)
+                sub_result = self.sampler.gather_logprobs(
+                    sub_logprobs, num_prompt_logprobs, sub_tgt
+                )
+                all_token_ids.append(sub_result.logprob_token_ids)
+                all_logprobs_list.append(sub_result.logprobs)
+                all_ranks.append(sub_result.selected_token_ranks)
+
+            # Concatenate sub-chunk results.
+            if len(all_token_ids) == 1:
+                token_ids = all_token_ids[0]
+                logprobs_out = all_logprobs_list[0]
+                ranks = all_ranks[0]
+            else:
+                token_ids = torch.cat(all_token_ids, dim=0)
+                logprobs_out = torch.cat(all_logprobs_list, dim=0)
+                ranks = torch.cat(all_ranks, dim=0)
 
             # Transfer GPU->CPU async.
-            chunk_slice = slice(start_idx, start_idx + num_logits)
+            chunk_slice = slice(
+                effective_start_idx,
+                effective_start_idx + effective_num_logits,
+            )
             logprobs_tensors.logprob_token_ids[chunk_slice].copy_(
                 token_ids, non_blocking=True
             )
-            logprobs_tensors.logprobs[chunk_slice].copy_(logprobs, non_blocking=True)
+            logprobs_tensors.logprobs[chunk_slice].copy_(
+                logprobs_out, non_blocking=True
+            )
             logprobs_tensors.selected_token_ranks[chunk_slice].copy_(
                 ranks, non_blocking=True
+
             )
 
         # Remove requests that have completed prefill from the batch
@@ -5112,6 +5202,7 @@ class GPUModelRunner(
         for req_id in completed_prefill_reqs:
             del num_prompt_logprobs_dict[req_id]
             del in_progress_dict[req_id]
+            self.prompt_logprob_token_limits.pop(req_id, None)
 
         # Must synchronize the non-blocking GPU->CPU transfers.
         if prompt_logprobs_dict:

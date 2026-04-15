@@ -480,6 +480,7 @@ class EngineArgs:
     long_prefill_token_threshold: int = SchedulerConfig.long_prefill_token_threshold
     max_num_seqs: int | None = None
     max_logprobs: int = ModelConfig.max_logprobs
+    max_prompt_logprob_tokens: int | None = ModelConfig.max_prompt_logprob_tokens
     logprobs_mode: LogprobsMode = ModelConfig.logprobs_mode
     disable_log_stats: bool = False
     aggregate_engine_logging: bool = False
@@ -749,6 +750,10 @@ class EngineArgs:
             **model_kwargs["enable_return_routed_experts"],
         )
         model_group.add_argument("--max-logprobs", **model_kwargs["max_logprobs"])
+        model_group.add_argument(
+            "--max-prompt-logprob-tokens",
+            **model_kwargs["max_prompt_logprob_tokens"],
+        )
         model_group.add_argument("--logprobs-mode", **model_kwargs["logprobs_mode"])
         model_group.add_argument(
             "--disable-sliding-window", **model_kwargs["disable_sliding_window"]
@@ -1470,6 +1475,7 @@ class EngineArgs:
             enforce_eager=self.enforce_eager,
             enable_return_routed_experts=self.enable_return_routed_experts,
             max_logprobs=self.max_logprobs,
+            max_prompt_logprob_tokens=self.max_prompt_logprob_tokens,
             logprobs_mode=self.logprobs_mode,
             disable_sliding_window=self.disable_sliding_window,
             disable_cascade_attn=self.disable_cascade_attn,
